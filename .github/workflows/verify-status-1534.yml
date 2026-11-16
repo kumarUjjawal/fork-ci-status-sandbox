@@ -1,0 +1,121 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+
+name: Verify commit status visibility
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        options: [normal, error]
+        default: normal
+      expected-writes:
+        description: Expected number of appended statuses
+        required: true
+        default: '2'
+permissions:
+  contents: read
+  actions: read
+  statuses: write
+  pull-requests: read
+concurrency:
+  group: verify-commit-status
+  cancel-in-progress: false
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: kumarUjjawal/infrastructure-actions
+          ref: 64e0a7ad8648c5d5edc3510100522b04ffe64f0b
+          persist-credentials: false
+          path: implementation
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
+        env:
+          FORK_CI_WORKFLOW: ci.yml
+          FORK_CI_CHECK_NAME: Fork CI status
+          FORK_CI_REPORTING: commit-status
+          FORK_CI_BASE_BRANCHES: main
+          FORK_CI_SWEEP_SIZE: '100'
+          FORK_CI_JOB_DETAILS: 'true'
+          VERIFY_MODE: ${{ inputs.mode }}
+          EXPECTED_WRITES: ${{ inputs.expected-writes }}
+        with:
+          script: |
+            const assert = require('node:assert/strict');
+            const { bridge } = require(`${process.env.GITHUB_WORKSPACE}/implementation/fork-ci/bridge.cjs`);
+            const mode = process.env.VERIFY_MODE;
+            let forbiddenReads = 0;
+            github.hook.before('request', (options) => {
+              if (/\/(jobs|annotations)(\?|$)/.test(options.url)) {
+                forbiddenReads++;
+                throw new Error('Commit status mode must not read jobs or annotations');
+              }
+              if (mode === 'error' && options.url.includes('/actions/workflows/') && options.url.endsWith('/runs')) {
+                throw Object.assign(new Error('Injected fork API outage'), { status: 503 });
+              }
+            });
+            const repo = context.repo;
+            const prs = (await github.paginate(github.rest.pulls.list, {
+              ...repo, state: 'open', per_page: 100,
+            })).filter(pr => pr.head.repo.full_name !== `${repo.owner}/${repo.repo}`);
+            assert.equal(prs.length, 2);
+            async function latest(pr) {
+              const reports = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
+                ...repo, ref: pr.head.sha, per_page: 100,
+              }, ({ data }, done) => {
+                const status = data.find(s => s.context === `Fork CI status (PR #${pr.number})`);
+                if (status) done();
+                return status ? [status] : [];
+              });
+              return reports[0];
+            }
+            const before = new Map();
+            for (const pr of prs) before.set(pr.number, await latest(pr));
+            const failures = [];
+            const observedCore = mode === 'error' ? {
+              ...core, setFailed: message => { failures.push(message); core.warning(message); },
+            } : core;
+            const counts = await bridge({ github, context, core: observedCore });
+            assert.equal(counts.processed, 2);
+            assert.equal(counts.written, Number(process.env.EXPECTED_WRITES));
+            assert.equal(counts.failed, mode === 'error' ? 2 : 0);
+            assert.equal(failures.length, mode === 'error' ? 1 : 0);
+            assert.equal(forbiddenReads, 0);
+            const rows = [];
+            for (const pr of prs) {
+              const status = await latest(pr);
+              const expected = mode === 'error' ? 'error' : ({ 'pr-fix': 'failure', 'pr-pass': 'success' })[pr.head.ref];
+              assert.equal(status.state, expected);
+              assert.equal(status.creator.login, 'github-actions[bot]');
+              if (counts.written === 0) assert.equal(status.id, before.get(pr.number).id);
+              rows.push([{ data: `#${pr.number}`, header: false }, status.context, status.state,
+                String(status.id), status.target_url]);
+              core.info(JSON.stringify({ pr: pr.number, head: pr.head.sha, status }));
+            }
+            await core.summary.addHeading('Hosted commit status verification')
+              .addRaw(`Implementation: 64e0a7ad8648c5d5edc3510100522b04ffe64f0b\n\n`)
+              .addRaw(`Mode: ${mode}; counts: ${JSON.stringify(counts)}; job/annotation reads: ${forbiddenReads}\n\n`)
+              .addTable([[{ data: 'PR', header: true }, { data: 'Context', header: true },
+                { data: 'State', header: true }, { data: 'Status ID', header: true },
+                { data: 'Target', header: true }], ...rows])
+              .addRaw('\n\n---\nDrafted-by: Codex (GPT-6) (no human review before posting)\n')
+              .write();
